@@ -3,6 +3,79 @@ package templates
 const BuildTemplate = `
 #!/bin/bash
 
+
+
+add_magisk() {
+if [ -z ${BUILD_NUMBER+x} ]; then
+BUILD_NUMBER=$(cat $BUILD_DIR/out/build_number.txt 2>/dev/null)
+fi
+
+rm -rf /home/ubuntu/workdir
+
+mkdir -p /home/ubuntu/workdir
+
+cd /home/ubuntu/workdir
+
+curl -s https://api.github.com/repos/topjohnwu/Magisk/releases | grep "Magisk-v.*.zip" |grep https|head -n 1| cut -d : -f 2,3|tr -d \" | wget -O magisk-latest.zip -qi -
+
+
+unzip -d magisk-latest magisk-latest.zip
+
+
+mkdir -p $BUILD_DIR/out/target/product/$DEVICE/obj/PACKAGING/target_files_intermediates/aosp_$DEVICE-target_files-$BUILD_NUMBER/BOOT/RAMDISK/.backup
+cp  $BUILD_DIR/out/target/product/$DEVICE/obj/PACKAGING/target_files_intermediates/aosp_$DEVICE-target_files-$BUILD_NUMBER/SYSTEM/bin/init $BUILD_DIR/out/target/product/$DEVICE/obj/PACKAGING/target_files_intermediates/aosp_$DEVICE-target_files-$BUILD_NUMBER/BOOT/RAMDISK/.backup/init
+
+rm $BUILD_DIR/out/target/product/$DEVICE/obj/PACKAGING/target_files_intermediates/aosp_$DEVICE-target_files-$BUILD_NUMBER/BOOT/RAMDISK/init
+cp  $BUILD_DIR/out/target/product/$DEVICE/obj/PACKAGING/target_files_intermediates/aosp_$DEVICE-target_files-$BUILD_NUMBER/SYSTEM/bin/init $BUILD_DIR/out/target/product/$DEVICE/obj/PACKAGING/target_files_intermediates/aosp_$DEVICE-target_files-$BUILD_NUMBER/BOOT/RAMDISK/init
+
+
+cp magisk-latest/arm/magiskinit64 $BUILD_DIR/out/target/product/$DEVICE/obj/PACKAGING/target_files_intermediates/aosp_$DEVICE-target_files-$BUILD_NUMBER/BOOT/RAMDISK/init
+
+
+cat <<EOF > $BUILD_DIR/out/target/product/$DEVICE/obj/PACKAGING/target_files_intermediates/aosp_$DEVICE-target_files-$BUILD_NUMBER/BOOT/RAMDISK/.backup/.magisk
+KEEPFORCEENCRYPT=true
+KEEPVERITY=true
+RECOVERYMODE=false
+EOF
+
+
+sed -i "/firmware 0 0 644/a .backup 0 0 000 selabel=u:object_r:rootfs:s0 capabilities=0x0\n.backup/init 0 2000 750 selabel=u:object_r:init_exec:s0 capabilities=0x0\n.backup/.magisk 0 2000 750 selabel=u:object_r:rootfs:s0 capabilities=0x0" $BUILD_DIR/out/target/product/$DEVICE/obj/PACKAGING/target_files_intermediates/aosp_$DEVICE-target_files*/META/boot_filesystem_config.txt
+
+
+git clone https://github.com/PabloCastellano/extract-dtb.git
+
+cd extract-dtb
+python3 ./extract-dtb.py $BUILD_DIR/out/target/product/$DEVICE/obj/PACKAGING/target_files_intermediates/aosp_$DEVICE-target_files-$BUILD_NUMBER/BOOT/kernel
+
+
+lz4 -d dtb/00_kernel dtb/uncompressed_kernel
+cd -
+
+chmod +x ./magisk-latest/x86/magiskboot
+./magisk-latest/x86/magiskboot hexpatch extract-dtb/dtb/uncompressed_kernel 736B69705F696E697472616D667300 77616E745F696E697472616D667300
+
+
+lz4 -f -9 extract-dtb/dtb/uncompressed_kernel extract-dtb/dtb/00_kernel
+rm extract-dtb/dtb/uncompressed_kernel
+
+
+rm $BUILD_DIR/out/target/product/$DEVICE/obj/PACKAGING/target_files_intermediates/aosp_$DEVICE-target_files-$BUILD_NUMBER/BOOT/kernel
+for file in extract-dtb/dtb/*
+do
+cat $file >> $BUILD_DIR/out/target/product/$DEVICE/obj/PACKAGING/target_files_intermediates/aosp_$DEVICE-target_files-$BUILD_NUMBER/BOOT/kernel
+done
+
+
+rm -f $BUILD_DIR/out/target/product/$DEVICE/obj/PACKAGING/target_files_intermediates/aosp_$DEVICE-target_files-$BUILD_NUMBER.zip
+
+
+cd $BUILD_DIR/out/target/product/$DEVICE/obj/PACKAGING/target_files_intermediates/aosp_$DEVICE-target_files-$BUILD_NUMBER
+zip --symlinks -r ../aosp_$DEVICE-target_files-$BUILD_NUMBER.zip *
+cd -
+
+}
+
+
 if [ $# -lt 1 ]; then
   echo "Need to specify device name as argument"
   exit 1
@@ -299,6 +372,7 @@ full_run() {
   fi
   add_chromium
   build_aosp
+  add_magisk
   release "${DEVICE}"
   aws_upload
   checkpoint_versions
