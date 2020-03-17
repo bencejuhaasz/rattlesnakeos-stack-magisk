@@ -199,7 +199,7 @@ FDROID_CLIENT_URL_LATEST="https://gitlab.com/api/v4/projects/36189/repository/ta
 FDROID_PRIV_EXT_URL_LATEST="https://gitlab.com/api/v4/projects/1481578/repository/tags"
 KERNEL_SOURCE_URL="https://android.googlesource.com/kernel/msm"
 AOSP_URL_BUILD="https://developers.google.com/android/images"
-AOSP_URL_BRANCH="https://source.android.com/setup/start/build-numbers"
+AOSP_URL_PLATFORM_BUILD="https://android.googlesource.com/platform/build"
 
 STACK_UPDATE_MESSAGE=
 LATEST_STACK_VERSION=
@@ -242,21 +242,81 @@ get_latest_versions() {
     exit 1
   fi
 
-  # attempt to automatically pick latest build version and branch. note this is likely to break with any page redesign. should also add some validation here.
+  # check for latest factory image and corresponding aosp branch
+  # this is going to continue being quite fragile unless another method for determining latest factory build is found
+  # parsing html that can change at any time and can have variations every month is never going to be reliable
+  echo "Searching for latest factory build date for device=${DEVICE} android_version=${ANDROID_VERSION}"
+  latest_factory_build_date=$(curl --fail -s "${AOSP_URL_BUILD}" | grep -A1 "${DEVICE}" | grep -F "${ANDROID_VERSION}" | tail -1 | cut -d"(" -f2 | cut -d"," -f2 | cut -d")" -f1 | sed -e 's/^[ \t]*//' || true)
+  if [ -z "$latest_factory_build_date" ]; then
+      aws_notify_simple "ERROR: Unable to determine latest factory build date for device=${DEVICE} android_version=${ANDROID_VERSION}. Stopping build. This lookup is pretty fragile and can break on any page redesign of ${AOSP_URL_BUILD}"
+      exit 1
+  fi
+  echo "latest_factory_build_date='${latest_factory_build_date}'"
+
+  # first check to see if any factory builds exist for this date
+  factory_builds=$(curl --fail -s "${AOSP_URL_BUILD}" | grep -A1 "${DEVICE}" | grep -F "${ANDROID_VERSION}" | grep "${latest_factory_build_date}" || true)
+  factory_builds_count=$(echo "$factory_builds" | wc -l | awk '{print $1}' || true)
+  if [ -z "$factory_builds" ]; then
+      factory_builds_count=0
+  fi
+  if [ "$factory_builds_count" -eq 0 ]; then
+      aws_notify_simple "ERROR: Unable to find any builds for latest_factory_build_date='${latest_factory_build_date}'. Stopping build. This lookup is pretty fragile and can break on any page redesign of ${AOSP_URL_BUILD}"
+      exit 1
+  fi
+
+  # if more than one factory build exists,
+  # first check strict (e.g. (QQ1A.200205.002, Feb 2020))
+  # second check for known variations that Google has used in the past - for now just removing anything with 'only'"
+  if [ "$factory_builds_count" -ne 1 ]; then
+      echo -e "\nAttempting strict filter to a single factory build"
+      factory_builds_strict=$(echo "$factory_builds" | egrep '[A-Z]{1}[a-z]{2} [0-9]{4}\)' || true)
+      factory_builds_strict_count=$(echo "$factory_builds_strict" | wc -l | awk '{print $1}' || true)
+      if [ -z "$factory_builds_strict" ]; then
+          factory_builds_strict_count=0
+      fi
+
+      if [ "$factory_builds_strict_count" -ne 1 ]; then
+          echo -e "\nAttempting loose filter to a single factory build"
+          factory_builds_loose=$(echo "$factory_builds" | grep -i -v 'only' || true)
+          factory_builds_loose_count=$(echo "$factory_builds_loose" | wc -l | awk '{print $1}' || true)
+          if [ -z "$factory_builds_loose" ]; then
+              factory_builds_loose_count=0
+          fi
+          if [ "$factory_builds_loose_count" -ne 1 ]; then
+              aws_notify_simple "ERROR: Unable to determine what build to use for latest_factory_build_date='${latest_factory_build_date}'. Stopping build. This lookup is pretty fragile and can break on any page redesign of ${AOSP_URL_BUILD}"
+              echo "factory_builds_loose_count=${factory_builds_loose_count} factory_builds_loose=${factory_builds_loose}"
+              exit 1
+          fi
+          factory_builds="${factory_builds_loose}"
+      else
+          factory_builds="${factory_builds_strict}"
+      fi
+  fi
+  AOSP_BUILD=$(echo "$factory_builds" | cut -d"(" -f2 | cut -d"," -f1 || true)
   if [ -z "$AOSP_BUILD" ]; then
-    AOSP_BUILD=$(curl --fail -s ${AOSP_URL_BUILD} | grep -A1 "${DEVICE}" | egrep '[a-zA-Z]+ [0-9]{4}\)' | grep -F "${ANDROID_VERSION}" | tail -1 | cut -d"(" -f2 | cut -d"," -f1)
-    if [ -z "$AOSP_BUILD" ]; then
-      aws_notify_simple "ERROR: Unable to get latest AOSP build information. Stopping build. This lookup is pretty fragile and can break on any page redesign of ${AOSP_URL_BUILD}"
+      echo "Unable to determine factory build number when parsing factory_builds='${factory_builds}'"
+      aws_notify_simple "ERROR: Unable to get latest AOSP build (factory build) information. Stopping build."
       exit 1
-    fi
   fi
+  echo "AOSP_BUILD=${AOSP_BUILD}"
+
+  AOSP_BRANCH=""
+  echo "Searching through latest AOSP tags to find tag that corresponds with factory build ${AOSP_BRANCH}"
+  for tag in $(git ls-remote --tags "${AOSP_URL_PLATFORM_BUILD}" | grep "android-${ANDROID_VERSION}" | grep -v '\^{}' | awk -F"/" '{print $3}' | sort -V | tac || true); do
+      echo "Searching tag ${tag} for build_id=${AOSP_BUILD}"
+      build_id=$(curl -s "${AOSP_URL_PLATFORM_BUILD}/+/refs/tags/${tag}/core/build_id.mk?format=TEXT" | base64 --decode | awk -F= '/BUILD_ID=/{print $2}' || true)
+      if [ "${AOSP_BUILD}" = "${build_id}" ]; then
+          AOSP_BRANCH="${tag}"
+          break
+      fi
+      echo "Skipping tag ${tag} as build_id=${build_id}"
+  done
   if [ -z "$AOSP_BRANCH" ]; then
-    AOSP_BRANCH=$(curl --fail -s ${AOSP_URL_BRANCH} | grep -A1 "${AOSP_BUILD}" | tail -1 | cut -f2 -d">"|cut -f1 -d"<")
-    if [ -z "$AOSP_BRANCH" ]; then
-      aws_notify_simple "ERROR: Unable to get latest AOSP branch information. Stopping build. This can happen if ${AOSP_URL_BRANCH} hasn't been updated yet with newly released factory images."
-      exit 1
-    fi
+    aws_notify_simple "ERROR: Unable to get latest AOSP branch information. Stopping build."
+    exit 1
   fi
+  echo "AOSP_BRANCH=${AOSP_BRANCH}"
+
 }
 
 check_for_new_versions() {
@@ -725,43 +785,40 @@ aosp_repo_modifications() {
   log_header ${FUNCNAME}
   cd "${BUILD_DIR}"
 
-  # make modifications to default AOSP
-  if ! grep -q "RattlesnakeOS" .repo/manifest.xml; then
-    # really ugly awk script to add additional repos to manifest
-    awk -i inplace \
-      -v ANDROID_VERSION="$ANDROID_VERSION" \
-      -v FDROID_CLIENT_VERSION="$FDROID_CLIENT_VERSION" \
-      -v FDROID_PRIV_EXT_VERSION="$FDROID_PRIV_EXT_VERSION" \
-      '1;/<repo-hooks in-project=/{
-      print "  ";
-      print "  <remote name=\"github\" fetch=\"https://github.com/RattlesnakeOS/\" revision=\"" ANDROID_VERSION "\" />";
-      print "  <remote name=\"fdroid\" fetch=\"https://gitlab.com/fdroid/\" />";
-      <% if .CustomManifestRemotes %>
-      <% range $i, $r := .CustomManifestRemotes %>
-      print "  <remote name=\"<% .Name %>\" fetch=\"<% .Fetch %>\" revision=\"<% .Revision %>\" />";
-      <% end %>
-      <% end %>
-      print "  ";
-      <% if .CustomManifestProjects %><% range $i, $r := .CustomManifestProjects %>
-      print "  <project path=\"<% .Path %>\" name=\"<% .Name %>\" remote=\"<% .Remote %>\" />";
-      <% end %>
-      <% end %>
-      <% if .EnableAttestation %>
-      print "  <project path=\"external/Auditor\" name=\"platform_external_Auditor\" remote=\"github\" />";
-      <% end %>
-      print "  <project path=\"external/chromium\" name=\"platform_external_chromium\" remote=\"github\" />";
-      print "  <project path=\"packages/apps/Updater\" name=\"platform_packages_apps_Updater\" remote=\"github\" />";
-      print "  <project path=\"packages/apps/F-Droid\" name=\"platform_external_fdroid\" remote=\"github\" />";
-      print "  <project path=\"packages/apps/F-DroidPrivilegedExtension\" name=\"privileged-extension\" remote=\"fdroid\" revision=\"refs/tags/" FDROID_PRIV_EXT_VERSION "\" />";
-      print "  <project path=\"vendor/android-prepare-vendor\" name=\"android-prepare-vendor\" remote=\"github\" />"}' .repo/manifest.xml
+  mkdir -p ${BUILD_DIR}/.repo/local_manifests
 
-    # remove things from manifest
-    sed -i '/packages\/apps\/Browser2/d' .repo/manifest.xml
-    sed -i '/packages\/apps\/Calendar/d' .repo/manifest.xml
-    sed -i '/packages\/apps\/QuickSearchBox/d' .repo/manifest.xml
-  else
-    log "Skipping modification of .repo/manifest.xml as they have already been made"
-  fi
+  cat <<EOF > ${BUILD_DIR}/.repo/local_manifests/rattlesnakeos.xml
+<?xml version="1.0" encoding="UTF-8"?>
+<manifest>
+  <remote name="github" fetch="https://github.com/RattlesnakeOS/" revision="${ANDROID_VERSION}" />
+  <remote name="fdroid" fetch="https://gitlab.com/fdroid/" />
+
+  <project path="external/chromium" name="platform_external_chromium" remote="github" />
+  <project path="packages/apps/Updater" name="platform_packages_apps_Updater" remote="github" />
+  <project path="packages/apps/F-Droid" name="platform_external_fdroid" remote="github" />
+  <project path="packages/apps/F-DroidPrivilegedExtension" name="privileged-extension" remote="fdroid" revision="refs/tags/${FDROID_PRIV_EXT_VERSION}" />
+  <project path="vendor/android-prepare-vendor" name="android-prepare-vendor" remote="github" />
+
+  <remove-project name="platform/packages/apps/Browser2" />
+  <remove-project name="platform/packages/apps/Calendar" />
+  <remove-project name="platform/packages/apps/QuickSearchBox" />
+
+  <% if .CustomManifestRemotes %>
+  <% range $i, $r := .CustomManifestRemotes %>
+  <remote name="<% .Name %>" fetch="<% .Fetch %>" revision="<% .Revision %>" />
+  <% end %>
+  <% end %>
+  <% if .CustomManifestProjects %><% range $i, $r := .CustomManifestProjects %>
+  <project path="<% .Path %>" name="<% .Name %>" remote="<% .Remote %>" />
+  <% end %>
+  <% end %>
+  <% if .EnableAttestation %>
+  <project path="external/Auditor" name="platform_external_Auditor" remote="github" />
+  <% end %>
+
+</manifest>
+EOF
+
 }
 
 aosp_repo_sync() {
