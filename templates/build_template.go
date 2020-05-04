@@ -86,29 +86,41 @@ DEVICE=$1
 case "$DEVICE" in
   marlin|sailfish)
     DEVICE_FAMILY=marlin
+    KERNEL_FAMILY=marlin
+    KERNEL_DEFCONFIG=marlin
     AVB_MODE=verity_only
     ;;
   taimen)
     DEVICE_FAMILY=taimen
+    KERNEL_FAMILY=wahoo
+    KERNEL_DEFCONFIG=wahoo
     AVB_MODE=vbmeta_simple
     ;;
   walleye)
     DEVICE_FAMILY=muskie
+    KERNEL_FAMILY=wahoo
+    KERNEL_DEFCONFIG=wahoo
     AVB_MODE=vbmeta_simple
     ;;
   crosshatch|blueline)
     DEVICE_FAMILY=crosshatch
+    KERNEL_FAMILY=crosshatch
+    KERNEL_DEFCONFIG=b1c1
     AVB_MODE=vbmeta_chained
     EXTRA_OTA=(--retrofit_dynamic_partitions)
     ;;
   sargo|bonito)
     DEVICE_FAMILY=bonito
+    KERNEL_FAMILY=bonito
+    KERNEL_DEFCONFIG=bonito
     AVB_MODE=vbmeta_chained
     EXTRA_OTA=(--retrofit_dynamic_partitions)
     ;;
   *)
     echo "warning: unknown device $DEVICE, using Pixel 3 defaults"
     DEVICE_FAMILY=$1
+    KERNEL_FAMILY=crosshatch
+    KERNEL_DEFCONFIG=b1c1
     AVB_MODE=vbmeta_chained
     ;;
 esac
@@ -123,6 +135,7 @@ fi
 # allow build and branch to be specified
 AOSP_BUILD=$3
 AOSP_BRANCH=$4
+AOSP_VENDOR_BUILD=
 
 # set region
 REGION=<% .Region %>
@@ -142,6 +155,10 @@ IGNORE_VERSION_CHECKS=<% .IgnoreVersionChecks %>
 
 # version of chromium to pin to if requested
 CHROMIUM_PINNED_VERSION=<% .ChromiumVersion %>
+
+# Whether the kernel needs to be rebuilt
+# It is always rebuilt for marlin/sailfish
+ENABLE_KERNEL_BUILD=false
 
 # whether keys are client side encrypted or not
 ENCRYPTED_KEYS="<% .EncryptedKeys %>"
@@ -187,7 +204,7 @@ BUILD_DIR="$HOME/rattlesnake-os"
 KEYS_DIR="${BUILD_DIR}/keys"
 CERTIFICATE_SUBJECT='/CN=RattlesnakeOS'
 OFFICIAL_FDROID_KEY="43238d512c1e5eb2d6569f4a3afbf5523418b82e0a3ed1552770abb9a9c9ccab"
-MARLIN_KERNEL_SOURCE_DIR="${HOME}/kernel/google/marlin"
+KERNEL_SOURCE_DIR="${HOME}/kernel/google/${KERNEL_FAMILY}"
 BUILD_REASON=""
 
 # urls
@@ -292,28 +309,35 @@ get_latest_versions() {
           factory_builds="${factory_builds_strict}"
       fi
   fi
-  AOSP_BUILD=$(echo "$factory_builds" | cut -d"(" -f2 | cut -d"," -f1 || true)
-  if [ -z "$AOSP_BUILD" ]; then
+
+  AOSP_VENDOR_BUILD=$(echo "$factory_builds" | cut -d"(" -f2 | cut -d"," -f1 || true)
+  if [ -z "$AOSP_VENDOR_BUILD" ]; then
       echo "Unable to determine factory build number when parsing factory_builds='${factory_builds}'"
       aws_notify_simple "ERROR: Unable to get latest AOSP build (factory build) information. Stopping build."
       exit 1
   fi
+  if [ -z "$AOSP_BUILD" ]; then
+      AOSP_BUILD=${AOSP_VENDOR_BUILD}
+  fi
+  echo "AOSP_VENDOR_BUILD=${AOSP_VENDOR_BUILD}"
   echo "AOSP_BUILD=${AOSP_BUILD}"
 
-  AOSP_BRANCH=""
-  echo "Searching through latest AOSP tags to find tag that corresponds with factory build ${AOSP_BRANCH}"
-  for tag in $(git ls-remote --tags "${AOSP_URL_PLATFORM_BUILD}" | grep "android-${ANDROID_VERSION}" | grep -v '\^{}' | awk -F"/" '{print $3}' | sort -V | tac || true); do
-      echo "Searching tag ${tag} for build_id=${AOSP_BUILD}"
-      build_id=$(curl -s "${AOSP_URL_PLATFORM_BUILD}/+/refs/tags/${tag}/core/build_id.mk?format=TEXT" | base64 --decode | awk -F= '/BUILD_ID=/{print $2}' || true)
-      if [ "${AOSP_BUILD}" = "${build_id}" ]; then
-          AOSP_BRANCH="${tag}"
-          break
-      fi
-      echo "Skipping tag ${tag} as build_id=${build_id}"
-  done
   if [ -z "$AOSP_BRANCH" ]; then
-    aws_notify_simple "ERROR: Unable to get latest AOSP branch information. Stopping build."
-    exit 1
+    AOSP_BRANCH=""
+    echo "Searching through latest AOSP tags to find tag that corresponds with factory build ${AOSP_BRANCH}"
+    for tag in $(git ls-remote --tags "${AOSP_URL_PLATFORM_BUILD}" | grep "android-${ANDROID_VERSION}" | grep -v '\^{}' | awk -F"/" '{print $3}' | sort -V | tac || true); do
+        echo "Searching tag ${tag} for build_id=${AOSP_BUILD}"
+        build_id=$(curl -s "${AOSP_URL_PLATFORM_BUILD}/+/refs/tags/${tag}/core/build_id.mk?format=TEXT" | base64 --decode | awk -F= '/BUILD_ID=/{print $2}' || true)
+        if [ "${AOSP_BUILD}" = "${build_id}" ]; then
+            AOSP_BRANCH="${tag}"
+            break
+        fi
+        echo "Skipping tag ${tag} as build_id=${build_id}"
+    done
+    if [ -z "$AOSP_BRANCH" ]; then
+      aws_notify_simple "ERROR: Unable to get latest AOSP branch information. Stopping build."
+      exit 1
+    fi
   fi
   echo "AOSP_BRANCH=${AOSP_BRANCH}"
 
@@ -337,12 +361,12 @@ check_for_new_versions() {
 
   # check aosp
   existing_aosp_build=$(aws s3 cp "s3://${AWS_RELEASE_BUCKET}/${DEVICE}-vendor" - || true)
-  if [ "$existing_aosp_build" == "$AOSP_BUILD" ]; then
+  if [ "$existing_aosp_build" == "$AOSP_VENDOR_BUILD" ]; then
     echo "AOSP build ($existing_aosp_build) is up to date"
   else
-    echo "AOSP needs to be updated to ${AOSP_BUILD}"
+    echo "AOSP needs to be updated to ${AOSP_VENDOR_BUILD}"
     needs_update=true
-    BUILD_REASON="$BUILD_REASON 'AOSP build $existing_aosp_build != $AOSP_BUILD'"
+    BUILD_REASON="$BUILD_REASON 'AOSP build $existing_aosp_build != $AOSP_VENDOR_BUILD'"
   fi
 
   # check chromium
@@ -427,8 +451,9 @@ full_run() {
   build_fdroid
   apply_patches
   # only marlin and sailfish need kernel rebuilt so that verity_key is included
-  if [ "${DEVICE}" == "marlin" ] || [ "${DEVICE}" == "sailfish" ]; then
-    rebuild_marlin_kernel
+  # Also build the kernel if enabled in the config 
+  if [ "${KERNEL_FAMILY}" == "marlin" ] || [ "${ENABLE_KERNEL_BUILD}" == "true" ]; then
+    rebuild_kernel
   fi
   add_chromium
   build_aosp
@@ -838,17 +863,17 @@ setup_vendor() {
   sudo DEBIAN_FRONTEND=noninteractive apt-get -y install python-protobuf
 
   # get vendor files (with timeout)
-  timeout 30m "${BUILD_DIR}/vendor/android-prepare-vendor/execute-all.sh" --debugfs --keep --yes --device "${DEVICE}" --buildID "${AOSP_BUILD}" --output "${BUILD_DIR}/vendor/android-prepare-vendor"
+  timeout 30m "${BUILD_DIR}/vendor/android-prepare-vendor/execute-all.sh" --debugfs --keep --yes --device "${DEVICE}" --buildID "${AOSP_VENDOR_BUILD}" --output "${BUILD_DIR}/vendor/android-prepare-vendor"
   
   # copy vendor files to build tree
   mkdir --parents "${BUILD_DIR}/vendor/google_devices" || true
   rm -rf "${BUILD_DIR}/vendor/google_devices/$DEVICE" || true
-  mv "${BUILD_DIR}/vendor/android-prepare-vendor/${DEVICE}/$(tr '[:upper:]' '[:lower:]' <<< "${AOSP_BUILD}")/vendor/google_devices/${DEVICE}" "${BUILD_DIR}/vendor/google_devices"
+  mv "${BUILD_DIR}/vendor/android-prepare-vendor/${DEVICE}/$(tr '[:upper:]' '[:lower:]' <<< "${AOSP_VENDOR_BUILD}")/vendor/google_devices/${DEVICE}" "${BUILD_DIR}/vendor/google_devices"
 
   # smaller devices need big brother vendor files
   if [ "$DEVICE" != "$DEVICE_FAMILY" ]; then
     rm -rf "${BUILD_DIR}/vendor/google_devices/$DEVICE_FAMILY" || true
-    mv "${BUILD_DIR}/vendor/android-prepare-vendor/$DEVICE/$(tr '[:upper:]' '[:lower:]' <<< "${AOSP_BUILD}")/vendor/google_devices/$DEVICE_FAMILY" "${BUILD_DIR}/vendor/google_devices"
+    mv "${BUILD_DIR}/vendor/android-prepare-vendor/$DEVICE/$(tr '[:upper:]' '[:lower:]' <<< "${AOSP_VENDOR_BUILD}")/vendor/google_devices/$DEVICE_FAMILY" "${BUILD_DIR}/vendor/google_devices"
   fi
 }
 
@@ -1070,17 +1095,26 @@ patch_launcher() {
   sed -i.original "s/boolean createEmptyRowOnFirstScreen;/boolean createEmptyRowOnFirstScreen = false;/" "${BUILD_DIR}/packages/apps/Launcher3/src/com/android/launcher3/provider/ImportDataTask.java"
 }
 
-rebuild_marlin_kernel() {
+rebuild_kernel() {
   log_header ${FUNCNAME}
 
   # checkout kernel source on proper commit
-  mkdir -p "${MARLIN_KERNEL_SOURCE_DIR}"
-  retry git clone "${KERNEL_SOURCE_URL}" "${MARLIN_KERNEL_SOURCE_DIR}"
+  mkdir -p "${KERNEL_SOURCE_DIR}"
+  retry git clone "${KERNEL_SOURCE_URL}" "${KERNEL_SOURCE_DIR}"
+  
+  if [ "${KERNEL_FAMILY}" == "marlin" ] || [ "${KERNEL_FAMILY}" == "wahoo" ]; then
+    kernel_image="${BUILD_DIR}/device/google/${KERNEL_FAMILY}-kernel/Image.lz4-dtb"
+  else
+    kernel_image="${BUILD_DIR}/device/google/${KERNEL_FAMILY}-kernel/Image.lz4"
+  fi
+
   # TODO: make this a bit more robust
-  kernel_commit_id=$(lz4cat "${BUILD_DIR}/device/google/marlin-kernel/Image.lz4-dtb" | grep -a 'Linux version' | cut -d ' ' -f3 | cut -d'-' -f2 | sed 's/^g//g')
-  cd "${MARLIN_KERNEL_SOURCE_DIR}"
+  kernel_commit_id=$(lz4cat "${kernel_image}" | strings | grep -a 'Linux version [0-9]' | cut -d ' ' -f3 | cut -d'-' -f2 | sed 's/^g//g')
+  cd "${KERNEL_SOURCE_DIR}"
   log "Checking out kernel commit ${kernel_commit_id}"
   git checkout ${kernel_commit_id}
+
+  # TODO: kernel patch hooks should be added here 
 
   # run in another shell to avoid it mucking with environment variables for normal AOSP build
   (
@@ -1090,11 +1124,44 @@ rebuild_marlin_kernel() {
       export PATH="${BUILD_DIR}/prebuilts/misc/linux-x86/lz4:${PATH}";
       export PATH="${BUILD_DIR}/prebuilts/misc/linux-x86/dtc:${PATH}";
       export PATH="${BUILD_DIR}/prebuilts/misc/linux-x86/libufdt:${PATH}";
-      ln --verbose --symbolic ${KEYS_DIR}/${DEVICE}/verity_user.der.x509 ${MARLIN_KERNEL_SOURCE_DIR}/verity_user.der.x509;
-      cd ${MARLIN_KERNEL_SOURCE_DIR};
-      make O=out ARCH=arm64 marlin_defconfig;
-      make -j$(nproc --all) O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi-
-      cp -f out/arch/arm64/boot/Image.lz4-dtb ${BUILD_DIR}/device/google/marlin-kernel/;
+      cd ${KERNEL_SOURCE_DIR};
+
+      if [ "${KERNEL_FAMILY}" == "marlin" ]; then
+        ln --verbose --symbolic ${KEYS_DIR}/${DEVICE}/verity_user.der.x509 ${KERNEL_SOURCE_DIR}/verity_user.der.x509;
+        make O=out ARCH=arm64 ${KERNEL_DEFCONFIG}_defconfig;
+        make -j$(nproc --all) \
+          O=out \
+          ARCH=arm64 \
+          CROSS_COMPILE=aarch64-linux-android- \
+          CROSS_COMPILE_ARM32=arm-linux-androideabi-
+        
+        cp -f out/arch/arm64/boot/Image.lz4-dtb ${BUILD_DIR}/device/google/${KERNEL_FAMILY}-kernel/;
+      fi
+
+      if [ "${KERNEL_FAMILY}" == "wahoo" ] || [ "${KERNEL_FAMILY}" == "crosshatch" ] || [ "${KERNEL_FAMILY}" == "bonito" ]; then
+        export PATH="${BUILD_DIR}/prebuilts/clang/host/linux-x86/clang-r353983c/bin:${PATH}";
+        export LD_LIBRARY_PATH="${BUILD_DIR}/prebuilts/clang/host/linux-x86/clang-r353983c/lib64:${LD_LIBRARY_PATH}";
+        make O=out ARCH=arm64 ${KERNEL_DEFCONFIG}_defconfig;
+        make -j$(nproc --all) \
+          O=out \
+          ARCH=arm64 \
+          CC=clang \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-android- \
+          CROSS_COMPILE_ARM32=arm-linux-androideabi-
+        
+        cp -f out/arch/arm64/boot/{dtbo.img,Image.lz4-dtb} ${BUILD_DIR}/device/google/${KERNEL_FAMILY}-kernel/;
+
+        if [ "${KERNEL_FAMILY}" == "crosshatch" ]; then
+          cp -f out/arch/arm64/boot/dts/qcom/{sdm845-v2.dtb,sdm845-v2.1.dtb} ${BUILD_DIR}/device/google/${KERNEL_FAMILY}-kernel/;
+        fi
+
+        if [ "${KERNEL_FAMILY}" == "bonito" ]; then
+          cp -f out/arch/arm64/boot/dts/qcom/sdm670.dtb ${BUILD_DIR}/device/google/${KERNEL_FAMILY}-kernel/;
+        fi
+      
+      fi
+      
       rm -rf ${BUILD_DIR}/out/build_*;
   )
 }
@@ -1103,6 +1170,12 @@ build_aosp() {
   log_header ${FUNCNAME}
 
   cd "$BUILD_DIR"
+
+  if [ "${AOSP_BUILD}" != "${AOSP_VENDOR_BUILD}" ]; then
+    log "WARNING: Requested AOSP build does not match upstream vendor files. These images may not be functional."
+    log "Patching build_id to match ${AOSP_BUILD}"
+    echo "${AOSP_BUILD}" > vendor/google_devices/${DEVICE}/build_id.txt
+  fi
 
   ############################
   # from original setup.sh script
@@ -1261,7 +1334,7 @@ checkpoint_versions() {
   echo "${FDROID_CLIENT_VERSION}" | aws s3 cp - "s3://${AWS_RELEASE_BUCKET}/fdroid/revision"
   
   # checkpoint aosp
-  aws s3 cp - "s3://${AWS_RELEASE_BUCKET}/${DEVICE}-vendor" --acl public-read <<< "${AOSP_BUILD}" || true
+  aws s3 cp - "s3://${AWS_RELEASE_BUCKET}/${DEVICE}-vendor" --acl public-read <<< "${AOSP_VENDOR_BUILD}" || true
   
   # checkpoint chromium
   echo "yes" | aws s3 cp - "s3://${AWS_RELEASE_BUCKET}/chromium/included"
@@ -1282,8 +1355,8 @@ aws_notify() {
   fi
   ELAPSED="$(($SECONDS / 3600))hrs $((($SECONDS / 60) % 60))min $(($SECONDS % 60))sec"
   aws sns publish --region ${REGION} --topic-arn "$AWS_SNS_ARN" \
-    --message="$(printf "$1\n  Device: %s\n  Stack Name: %s\n  Stack Version: %s %s\n  Stack Region: %s\n  Release Channel: %s\n  Instance Type: %s\n  Instance Region: %s\n  Instance IP: %s\n  Build Date: %s\n  Elapsed Time: %s\n  AOSP Build: %s\n  AOSP Branch: %s\n  Chromium Version: %s\n  F-Droid Version: %s\n  F-Droid Priv Extension Version: %s\n  Build Reason: %s\n%s" \
-      "${DEVICE}" "${STACK_NAME}" "${STACK_VERSION}" "${STACK_UPDATE_MESSAGE}" "${REGION}" "${RELEASE_CHANNEL}" "${INSTANCE_TYPE}" "${INSTANCE_REGION}" "${INSTANCE_IP}" "${BUILD_DATE}" "${ELAPSED}" "${AOSP_BUILD}" "${AOSP_BRANCH}" "${LATEST_CHROMIUM}" "${FDROID_CLIENT_VERSION}" "${FDROID_PRIV_EXT_VERSION}" "${BUILD_REASON}" "${LOGOUTPUT}")" || true
+    --message="$(printf "$1\n  Device: %s\n  Stack Name: %s\n  Stack Version: %s %s\n  Stack Region: %s\n  Release Channel: %s\n  Instance Type: %s\n  Instance Region: %s\n  Instance IP: %s\n  Build Date: %s\n  Elapsed Time: %s\n  AOSP Build: %s\n  AOSP Vendor Build: %s\n  AOSP Branch: %s\n  Chromium Version: %s\n  F-Droid Version: %s\n  F-Droid Priv Extension Version: %s\n  Build Reason: %s\n%s" \
+      "${DEVICE}" "${STACK_NAME}" "${STACK_VERSION}" "${STACK_UPDATE_MESSAGE}" "${REGION}" "${RELEASE_CHANNEL}" "${INSTANCE_TYPE}" "${INSTANCE_REGION}" "${INSTANCE_IP}" "${BUILD_DATE}" "${ELAPSED}" "${AOSP_BUILD}" "${AOSP_VENDOR_BUILD}" "${AOSP_BRANCH}" "${LATEST_CHROMIUM}" "${FDROID_CLIENT_VERSION}" "${FDROID_PRIV_EXT_VERSION}" "${BUILD_REASON}" "${LOGOUTPUT}")" || true
 }
 
 aws_logging() {
