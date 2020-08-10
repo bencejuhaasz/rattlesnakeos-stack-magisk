@@ -1,7 +1,8 @@
 RattlesnakeOS is a privacy and security focused Android OS for Google Pixel phones.
 
 ## Features
-* Builds AOSP with Magisk included
+* **Tracks latest stable version of android even on EOL OG Pixels (currently ten)**
+* **Builds AOSP with Magisk included**
 * Based on latest [AOSP](https://source.android.com/) 10.0
 * Active Support for Google <b>Pixel 2-4(a) (XL)</b>
 * Legacy Support for Google <b>Pixel, Pixel XL</b>. These devices no longer receive security updates and will eventually be deprecated.
