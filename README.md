@@ -5,7 +5,8 @@ RattlesnakeOS is a privacy and security focused Android OS for Google Pixel phon
 * **Builds AOSP with Magisk included**
 * Based on latest [AOSP](https://source.android.com/) 10.0
 * Active Support for Google <b>Pixel 2-4(a) (XL)</b>
-* Legacy Support for Google <b>Pixel, Pixel XL</b>. These devices no longer receive security updates and will eventually be deprecated.
+* Legacy Support for Google <b>Pixel, Pixel XL</b>'s vendor stack. They get system updates here unlike on default dan-v rattlesnake stack. Vendor stacks contain
+  proprietary software and can't be updated, but since both devices are Project Treble supported they should work for a while with new system images.
 * Monthly software and firmware security fixes delivered through built in OTA updater
 * [Verified boot](https://source.android.com/security/verifiedboot/) with a locked bootloader just like official Android but with your own personal signing keys
 * Latest stable Chromium [browser](https://www.chromium.org) and [webview](https://www.chromium.org/developers/how-tos/build-instructions-android-webview)
