@@ -145,8 +145,8 @@ if [ "$2" = true ]; then
 fi
 
 # allow build and branch to be specified
-AOSP_BUILD="QQ3A.200805.001"
-AOSP_BRANCH="android-10.0.0_r41"
+AOSP_BUILD="QD4A.200805.003"
+AOSP_BRANCH="android-10.0.0_r45"
 AOSP_VENDOR_BUILD=
 
 # set region
